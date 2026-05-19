@@ -126,6 +126,15 @@ def detect_binaries() -> list[Path]:
     add_candidate(found, seen, home / ".local/bin/claude.exe")
     add_candidate(found, seen, home / ".local/bin/claude")
 
+    for bun_npm in (
+        home / ".bun/install/global/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+        home / ".bun/install/global/node_modules/@anthropic-ai/claude-code-win32-x64/claude.exe",
+    ):
+        add_candidate(found, seen, bun_npm)
+
+    for npm_global in home.glob("AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe"):
+        add_candidate(found, seen, npm_global)
+
     versions_dir = home / ".local/share/claude/versions"
     if versions_dir.is_dir():
         for candidate in versions_dir.iterdir():
@@ -242,13 +251,16 @@ def locate_noauth_sites(data: bytes) -> list[int]:
 
 
 def locate_policyblocked_ui_sites(data: bytes) -> list[int]:
+    """Return byte offsets of policyBlocked default values (old: 'f', new: '1' in '!1')."""
     sites = []
     prefix = b"policyBlocked:"
     for off in find_all(data, prefix):
         site = off + len(prefix)
         tail = data[site : site + 3]
-        if tail in (b"f&&", b"0&&"):
+        if tail[:1] == b"f":
             sites.append(site)
+        elif tail[:1] == b"!" and len(tail) > 1 and tail[1:2] == b"1":
+            sites.append(site + 1)
     return sites
 
 
@@ -282,34 +294,20 @@ def classify_bun_source_fallback(data: bytes) -> tuple[str, list[str], bool]:
 
 def classify_legacy_patch(data: bytes) -> tuple[str, list[str]]:
     checks = [
-        ("feature flag", locate_feature_flag_sites(data), 0x31, 0x30, 2),
-        (
-            "auth bypass",
-            locate_backwards_sites(
-                data,
-                b'?.accessToken)return{action:"skip",kind:"auth"',
-                b"if(!",
-                b"if( ",
-                3,
-                30,
-            ),
-            0x21,
-            0x20,
-            2,
-        ),
+        ("feature flag", locate_feature_flag_sites(data), 0x31, 0x30, 1),
         (
             "allowlist bypass (plugin)",
             locate_backwards_sites(
                 data,
                 b'.marketplace))return{action:"skip",kind:"allowlist"',
-                b"&&!",
-                b"&& ",
-                2,
+                b"if(!",
+                b"if( ",
+                3,
                 80,
             ),
             0x21,
             0x20,
-            2,
+            1,
         ),
         (
             "allowlist bypass (server)",
@@ -323,10 +321,9 @@ def classify_legacy_patch(data: bytes) -> tuple[str, list[str]]:
             ),
             0x21,
             0x20,
-            2,
+            1,
         ),
-        ("noAuth bypass", locate_noauth_sites(data), 0x21, 0x2B, 2),
-        ("permissions flag", locate_permissions_flag_sites(data), 0x31, 0x30, 2),
+        ("permissions flag", locate_permissions_flag_sites(data), 0x31, 0x30, 1),
     ]
 
     clean = 0
@@ -366,10 +363,9 @@ def classify_legacy_patch(data: bytes) -> tuple[str, list[str]]:
 
 def classify_decision_support_patches(data: bytes) -> tuple[str, list[str]]:
     checks = [
-        ("feature flag", locate_feature_flag_sites(data), 0x31, 0x30, 2, True),
-        ("permissions flag", locate_permissions_flag_sites(data), 0x31, 0x30, 2, True),
-        ("noAuth UI state", locate_noauth_sites(data), 0x21, 0x2B, 2, True),
-        ("policyBlocked UI state", locate_policyblocked_ui_sites(data), 0x66, 0x30, 2, False),
+        ("feature flag", locate_feature_flag_sites(data), 0x31, 0x30, 1, True),
+        ("permissions flag", locate_permissions_flag_sites(data), 0x31, 0x30, 1, True),
+        ("policyBlocked UI state", locate_policyblocked_ui_sites(data), 0x66, 0x30, 1, False),
     ]
 
     required_clean = 0
@@ -427,30 +423,29 @@ def apply_decision_support_patches(data: bytearray) -> int:
 
     desc = "tengu_harbor default"
     offsets = locate_feature_flag_sites(data)
-    if len(offsets) < 2:
-        sys.exit(f"FAIL [{desc}]: expected >=2 matches, found {len(offsets)}")
+    if len(offsets) < 1:
+        sys.exit(f"FAIL [{desc}]: expected >=1 matches, found {len(offsets)}")
     for site in offsets:
         edits += patch_byte(data, site, 0x31, 0x30, desc)
 
     desc = "tengu_harbor_permissions default"
     offsets = locate_permissions_flag_sites(data)
-    if len(offsets) < 2:
-        sys.exit(f"FAIL [{desc}]: expected >=2 matches, found {len(offsets)}")
+    if len(offsets) < 1:
+        sys.exit(f"FAIL [{desc}]: expected >=1 matches, found {len(offsets)}")
     for site in offsets:
         edits += patch_byte(data, site, 0x31, 0x30, desc)
 
-    desc = "channels notice noAuth UI"
-    offsets = locate_noauth_sites(data)
-    if len(offsets) < 2:
-        sys.exit(f"FAIL [{desc}]: expected >=2 matches, found {len(offsets)}")
-    for site in offsets:
-        edits += patch_byte(data, site, 0x21, 0x2B, desc)
-
     desc = "channels notice policyBlocked UI"
     offsets = locate_policyblocked_ui_sites(data)
-    if len(offsets) >= 2:
+    if len(offsets) >= 1:
         for site in offsets:
-            edits += patch_byte(data, site, 0x66, 0x30, desc)
+            actual = data[site]
+            if actual == 0x66:
+                edits += patch_byte(data, site, 0x66, 0x30, desc)
+            elif actual == 0x31:
+                edits += patch_byte(data, site, 0x31, 0x30, desc)
+            else:
+                print(f"  SKIP {desc} @{site}: unexpected byte 0x{actual:02x}")
     else:
         print(f"  SKIP {desc} (optional, found {len(offsets)} site(s))")
 
@@ -464,36 +459,22 @@ def apply_legacy_patches(data: bytearray) -> int:
 
     desc = "tengu_harbor default"
     offsets = locate_feature_flag_sites(data)
-    if len(offsets) < 2:
-        sys.exit(f"FAIL [{desc}]: expected >=2 matches, found {len(offsets)}")
+    if len(offsets) < 1:
+        sys.exit(f"FAIL [{desc}]: expected >=1 matches, found {len(offsets)}")
     for site in offsets:
         edits += patch_byte(data, site, 0x31, 0x30, desc)
-
-    desc = "B6f auth bypass"
-    offsets = locate_backwards_sites(
-        data,
-        b'?.accessToken)return{action:"skip",kind:"auth"',
-        b"if(!",
-        b"if( ",
-        3,
-        30,
-    )
-    if len(offsets) < 2:
-        sys.exit(f"FAIL [{desc}]: expected >=2 matches, found {len(offsets)}")
-    for site in offsets:
-        edits += patch_byte(data, site, 0x21, 0x20, desc)
 
     desc = "allowlist bypass (plugin)"
     offsets = locate_backwards_sites(
         data,
         b'.marketplace))return{action:"skip",kind:"allowlist"',
-        b"&&!",
-        b"&& ",
-        2,
+        b"if(!",
+        b"if( ",
+        3,
         80,
     )
-    if len(offsets) < 2:
-        sys.exit(f"FAIL [{desc}]: expected >=2 matches, found {len(offsets)}")
+    if len(offsets) < 1:
+        sys.exit(f"FAIL [{desc}]: expected >=1 matches, found {len(offsets)}")
     for site in offsets:
         edits += patch_byte(data, site, 0x21, 0x20, desc)
 
@@ -506,22 +487,15 @@ def apply_legacy_patches(data: bytearray) -> int:
         3,
         30,
     )
-    if len(offsets) < 2:
-        sys.exit(f"FAIL [{desc}]: expected >=2 matches, found {len(offsets)}")
+    if len(offsets) < 1:
+        sys.exit(f"FAIL [{desc}]: expected >=1 matches, found {len(offsets)}")
     for site in offsets:
         edits += patch_byte(data, site, 0x21, 0x20, desc)
 
-    desc = "bl6 noAuth bypass"
-    offsets = locate_noauth_sites(data)
-    if len(offsets) < 2:
-        sys.exit(f"FAIL [{desc}]: expected >=2 matches, found {len(offsets)}")
-    for site in offsets:
-        edits += patch_byte(data, site, 0x21, 0x2B, desc)
-
     desc = "tengu_harbor_permissions default"
     offsets = locate_permissions_flag_sites(data)
-    if len(offsets) < 2:
-        sys.exit(f"FAIL [{desc}]: expected >=2 matches, found {len(offsets)}")
+    if len(offsets) < 1:
+        sys.exit(f"FAIL [{desc}]: expected >=1 matches, found {len(offsets)}")
     for site in offsets:
         edits += patch_byte(data, site, 0x31, 0x30, desc)
 
@@ -730,13 +704,13 @@ def locate_patched_decision_bodies(data: bytes) -> list[tuple[int, int]]:
 
 def looks_like_decision_patched(data: bytes) -> bool:
     support_state, _details = classify_decision_support_patches(data)
-    return len(locate_patched_decision_bodies(data)) >= 2 and support_state == "patched"
+    return len(locate_patched_decision_bodies(data)) >= 1 and support_state == "patched"
 
 
 def apply_decision_patches(data: bytearray) -> int:
     patches = locate_decision_patches(bytes(data))
-    if len(patches) < 2:
-        if len(locate_patched_decision_bodies(data)) >= 2:
+    if len(patches) < 1:
+        if len(locate_patched_decision_bodies(data)) >= 1:
             return apply_decision_support_patches(data)
         return 0
 
@@ -811,11 +785,11 @@ def choose_patch_strategy(data: bytes, requested: str) -> str:
     if requested == "legacy":
         return "legacy"
     if requested == "decision":
-        if len(locate_decision_patches(data)) < 2 and len(locate_patched_decision_bodies(data)) < 2:
-            sys.exit("FAIL [decision]: could not safely locate both decision-function copies")
+        if len(locate_decision_patches(data)) < 1 and len(locate_patched_decision_bodies(data)) < 1:
+            sys.exit("FAIL [decision]: could not safely locate the decision-function body")
         return "decision"
 
-    if len(locate_decision_patches(data)) >= 2 or len(locate_patched_decision_bodies(data)) >= 2:
+    if len(locate_decision_patches(data)) >= 1 or len(locate_patched_decision_bodies(data)) >= 1:
         return "decision"
     return "legacy"
 
@@ -963,8 +937,8 @@ def patch(binary: Path, requested_strategy: str):
 
     if strategy == "decision":
         edits = apply_decision_patches(data)
-        if edits < 2:
-            sys.exit("FAIL [decision]: could not safely rewrite both decision-function copies")
+        if edits < 1:
+            sys.exit("FAIL [decision]: could not safely rewrite the decision-function body")
     else:
         edits = apply_legacy_patches(data)
 
